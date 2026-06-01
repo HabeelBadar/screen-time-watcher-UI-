@@ -1,4 +1,4 @@
-NOTE: This is for Windows only.
+NOTE: This is for Windows only. One of the apps below are neccesary for the pragram to work.
 
 This is a custom UI for popular Windows screen time apps, which are:
 
