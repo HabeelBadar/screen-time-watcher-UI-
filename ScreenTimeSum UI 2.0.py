@@ -29,7 +29,9 @@ CAT_COLORS = {
     "Other":        "#7f77dd",
 }
 
+DATE_RE  = re.compile(r"(\d{2}-\d{2}-\d{4})")
 DATE_FMT = "%m-%d-%Y"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility helpers
@@ -62,95 +64,176 @@ def fmt_hms(secs):
     return f"{s}s"
 
 
-def load_activitywatch_data(date_from=None, date_to=None):
-    """Load and process screen time data from ActivityWatch."""
-    totals = defaultdict(int)
-    app_titles = {}  # Store window titles for each app
-    
-    # Connect to ActivityWatch (no close method needed)
-    client = ActivityWatchClient("screen-time-dashboard", testing=False)
-    
-    # Get all buckets
-    buckets = client.get_buckets()
-    
-    # Find the window bucket
-    window_bucket_id = None
-    for bucket_id in buckets:
-        if 'aw-watcher-window' in bucket_id:
-            window_bucket_id = bucket_id
-            break
-    
-    if not window_bucket_id:
-        raise Exception("No window activity bucket found. Make sure ActivityWatch is tracking windows.")
-    
-    # Set time range
-    if date_from:
-        start = datetime.combine(date_from, datetime.min.time())
-    else:
-        start = datetime.now() - timedelta(days=30)
-    
-    if date_to:
-        end = datetime.combine(date_to, datetime.max.time())
-    else:
-        end = datetime.now()
-    
-    # Convert to UTC for ActivityWatch
-    start_utc = start.replace(tzinfo=timezone.utc)
-    end_utc = end.replace(tzinfo=timezone.utc)
-    
-    # Get window events
-    events = client.get_events(window_bucket_id, start=start_utc, end=end_utc)
-    
-    # Track dates covered
-    dates_covered = set()
-    
-    # Process each event
-    for event in events:
-        # Get the app name from the event data
-        app_name = None
-        if hasattr(event, 'data') and isinstance(event.data, dict):
-            # Try different possible field names
-            app_name = event.data.get('app')
-            if not app_name:
-                app_name = event.data.get('exe')
-            if not app_name:
-                app_name = event.data.get('window_title')
-        
-        if not app_name:
+def parse_date_from_filename(filename):
+    m = DATE_RE.search(filename)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), DATE_FMT).date()
+        except ValueError:
+            pass
+    return None
+
+
+def load_logs_by_date(folder, date_from=None, date_to=None):
+    """Load log files and return data organized by date"""
+    logs_by_date = defaultdict(lambda: defaultdict(int))
+    logs_descs = defaultdict(dict)
+    filter_active = (date_from is not None) or (date_to is not None)
+    matched_dates = []
+
+    for filename in sorted(os.listdir(folder)):
+        if not filename.endswith(".log"):
             continue
+        file_date = parse_date_from_filename(filename)
+
+        if filter_active:
+            if file_date is None:
+                continue
+            if date_from and file_date < date_from:
+                continue
+            if date_to and file_date > date_to:
+                continue
+
+        if file_date:
+            matched_dates.append(file_date)
+
+        filepath = os.path.join(folder, filename)
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) < 2:
+                    continue
+                name = parts[0].strip()
+                try:
+                    secs = int(parts[1].strip())
+                except ValueError:
+                    continue
+                desc = parts[2].strip() if len(parts) >= 3 else ""
+                logs_by_date[file_date][name] += secs
+                if desc and name not in logs_descs[file_date]:
+                    logs_descs[file_date][name] = desc
+
+    return logs_by_date, logs_descs, matched_dates
+
+
+def load_activitywatch_by_date(date_from=None, date_to=None):
+    """Load ActivityWatch data organized by date (applications only, not window titles)"""
+    try:
+        aw_by_date = defaultdict(lambda: defaultdict(int))
+        aw_descs = defaultdict(dict)
         
-        # Clean up app name
-        app_name = app_name.replace('.exe', '').replace('.EXE', '')
+        # Connect to ActivityWatch
+        client = ActivityWatchClient("screen-time-dashboard", testing=False)
         
-        # Get local date from event timestamp
-        event_local = event.timestamp.replace(tzinfo=timezone.utc).astimezone()
-        event_date = event_local.date()
-        dates_covered.add(event_date)
+        # Get all buckets
+        buckets = client.get_buckets()
         
-        # Add duration
-        duration = event.duration.total_seconds()
-        totals[app_name] += duration
+        # Find the window bucket (this contains app data)
+        window_bucket_id = None
+        for bucket_id in buckets:
+            if 'aw-watcher-window' in bucket_id:
+                window_bucket_id = bucket_id
+                break
         
-        # Store a sample window title for this app
-        if hasattr(event, 'data') and isinstance(event.data, dict):
-            title = event.data.get('title', '')
-            if title and app_name not in app_titles:
-                # Truncate long titles
-                app_titles[app_name] = title[:60] if len(title) > 60 else title
+        if not window_bucket_id:
+            return None, None, None
+        
+        # Set time range
+        if date_from:
+            start = datetime.combine(date_from, datetime.min.time())
+        else:
+            start = datetime.now() - timedelta(days=30)
+        
+        if date_to:
+            end = datetime.combine(date_to, datetime.max.time())
+        else:
+            end = datetime.now()
+        
+        # Convert to UTC for ActivityWatch
+        start_utc = start.replace(tzinfo=timezone.utc)
+        end_utc = end.replace(tzinfo=timezone.utc)
+        
+        # Get window events
+        events = client.get_events(window_bucket_id, start=start_utc, end=end_utc)
+        
+        # Process each event
+        for event in events:
+            # Get the app name from the event data (NOT window title)
+            app_name = None
+            if hasattr(event, 'data') and isinstance(event.data, dict):
+                # Priority: app name (the executable), not window title
+                app_name = event.data.get('app')
+                if not app_name:
+                    app_name = event.data.get('exe')
+            
+            if not app_name:
+                continue
+            
+            # Clean up app name
+            app_name = app_name.replace('.exe', '').replace('.EXE', '')
+            
+            # Get local date from event timestamp
+            event_local = event.timestamp.replace(tzinfo=timezone.utc).astimezone()
+            event_date = event_local.date()
+            
+            # Add duration
+            duration = event.duration.total_seconds()
+            aw_by_date[event_date][app_name] += duration
+            
+            # Store a sample description
+            if app_name not in aw_descs[event_date]:
+                aw_descs[event_date][app_name] = app_name
+        
+        return aw_by_date, aw_descs, list(aw_by_date.keys())
+        
+    except Exception as e:
+        print(f"ActivityWatch error: {e}")
+        return None, None, None
+
+
+def combine_data(aw_data, aw_descs, logs_data, logs_descs):
+    """Combine ActivityWatch and log data, prioritizing ActivityWatch for dates that exist in both"""
+    combined_totals = defaultdict(int)
+    combined_descs = {}
+    all_dates = set()
     
-    # Build rows with categorization
+    # Add ActivityWatch data first (priority)
+    if aw_data:
+        for date_key, apps in aw_data.items():
+            all_dates.add(date_key)
+            for app_name, secs in apps.items():
+                combined_totals[app_name] += secs
+                if app_name in aw_descs.get(date_key, {}):
+                    combined_descs[app_name] = aw_descs[date_key][app_name]
+    
+    # Add log data ONLY for dates NOT in ActivityWatch
+    if logs_data:
+        for date_key, apps in logs_data.items():
+            # Only add log data if this date is NOT already covered by ActivityWatch
+            if aw_data and date_key in aw_data:
+                continue  # Skip this date - ActivityWatch already has it
+            
+            all_dates.add(date_key)
+            for app_name, secs in apps.items():
+                combined_totals[app_name] += secs
+                if app_name in logs_descs.get(date_key, {}):
+                    # Only set description if not already set by ActivityWatch
+                    if app_name not in combined_descs:
+                        combined_descs[app_name] = logs_descs[date_key][app_name]
+    
+    # Build rows
     rows = [
         {
             "name": n, 
-            "desc": app_titles.get(n, n),
+            "desc": combined_descs.get(n, n),
             "secs": int(s), 
             "cat": categorize(n)
         }
-        for n, s in sorted(totals.items(), key=lambda x: x[1], reverse=True)
-        if s > 60  # Filter out entries with less than 1 minute
+        for n, s in sorted(combined_totals.items(), key=lambda x: x[1], reverse=True)
+        if s > 60
     ]
     
-    return rows, sorted(list(dates_covered))
+    return rows, sorted(list(all_dates))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,12 +403,13 @@ class RoundedDateEntry(tk.Frame):
 class ScreenTimeDashboard(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Screen Time Dashboard - ActivityWatch")
+        self.title("Screen Time Dashboard (ActivityWatch + Logs Combined)")
         self.geometry("1280x910")
         self.configure(bg=BG)
         self.resizable(True, True)
 
         self.data       = []
+        self.log_folder = None
         self.top_n_var  = tk.IntVar(value=15)
         self.cat_var    = tk.StringVar(value="All")
         self.sort_var   = tk.StringVar(value="Time (desc)")
@@ -341,9 +425,11 @@ class ScreenTimeDashboard(tk.Tk):
 
         self._style_ttk()
         self._build_ui()
-        
-        # Auto-load data on startup
-        self.after(100, lambda: self._load())
+
+        default = os.path.expandvars(r"%LOCALAPPDATA%\digital-wellbeing\dailylogs")
+        if os.path.isdir(default):
+            self.log_folder = default
+            self._load()
 
     def _style_ttk(self):
         s = ttk.Style()
@@ -368,13 +454,17 @@ class ScreenTimeDashboard(tk.Tk):
         # Top bar
         topbar = tk.Frame(self, bg=SURFACE, pady=12)
         topbar.pack(fill="x")
-        tk.Label(topbar, text="⏱  Screen Time Dashboard (ActivityWatch)",
+        tk.Label(topbar, text="⏱  Screen Time Dashboard (ActivityWatch + Logs Combined)",
                  font=("Segoe UI", 15, "bold"), fg=TEXT, bg=SURFACE
                  ).pack(side="left", padx=20)
         
-        # Refresh button
-        tk.Button(topbar, text="🔄  Refresh Data",
-                  command=self._load,
+        # Info label
+        info_label = tk.Label(topbar, text="⚠️ ActivityWatch prioritized | Logs fill missing dates",
+                              font=("Segoe UI", 9), fg=ACCENT, bg=SURFACE)
+        info_label.pack(side="left", padx=20)
+        
+        tk.Button(topbar, text="📂  Open Logs Folder",
+                  command=self._browse,
                   bg=ACCENT, fg="white", font=("Segoe UI", 10),
                   relief="flat", padx=14, pady=6, cursor="hand2"
                   ).pack(side="right", padx=18)
@@ -531,7 +621,7 @@ class ScreenTimeDashboard(tk.Tk):
         sb.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
 
-        self.status_var = tk.StringVar(value="Ready - Click Refresh to load data")
+        self.status_var = tk.StringVar(value="Ready - Loading data...")
         tk.Label(self, textvariable=self.status_var,
                  font=("Segoe UI", 9), fg=MUTED, bg=BG, anchor="w"
                  ).pack(fill="x", padx=22, pady=(0, 6))
@@ -542,8 +632,14 @@ class ScreenTimeDashboard(tk.Tk):
         except ValueError:
             return None
 
+    def _browse(self):
+        folder = filedialog.askdirectory(title="Select daily logs folder")
+        if folder:
+            self.log_folder = folder
+            self._load()
+
     def _load(self):
-        """Load data from ActivityWatch with current date filter"""
+        """Load and combine data from ActivityWatch (priority) and logs (fallback)"""
         mode = self.date_mode.get()
         date_from = date_to = None
 
@@ -554,7 +650,6 @@ class ScreenTimeDashboard(tk.Tk):
                     "Please enter a valid date in MM-DD-YYYY format.")
                 return
             date_from = date_to = d
-
         elif mode == "range":
             date_from = self._parse_date_var(self.range_from)
             date_to   = self._parse_date_var(self.range_to)
@@ -564,7 +659,6 @@ class ScreenTimeDashboard(tk.Tk):
                 return
             if date_from > date_to:
                 date_from, date_to = date_to, date_from
-
         elif mode == "upto":
             date_to = self._parse_date_var(self.upto_date)
             if date_to is None:
@@ -572,45 +666,53 @@ class ScreenTimeDashboard(tk.Tk):
                     "Please enter a valid date in MM-DD-YYYY format.")
                 return
 
-        try:
-            self.status_var.set("Loading data from ActivityWatch...")
+        self.status_var.set("Loading data from ActivityWatch (priority)...")
+        self.update_idletasks()
+
+        # Load ActivityWatch data
+        aw_data, aw_descs, aw_dates = load_activitywatch_by_date(date_from, date_to)
+        
+        # Load log data
+        logs_data = None
+        logs_descs = None
+        logs_dates = []
+        if self.log_folder:
+            self.status_var.set("Loading fallback data from logs...")
             self.update_idletasks()
-            
-            rows, dates_covered = load_activitywatch_data(date_from, date_to)
-            
-            if not rows:
-                messagebox.showinfo("No data", 
-                    "No ActivityWatch data found for the selected date range.\n\n"
-                    "Make sure ActivityWatch has been tracking your activity.\n"
-                    "Leave it running in the background for a while to collect data.")
-                return
-            
-            self.data = rows
-            
-            if dates_covered:
-                mn = min(dates_covered).strftime(DATE_FMT)
-                mx = max(dates_covered).strftime(DATE_FMT)
-                n = len(dates_covered)
-                self.date_info_var.set(f"✓ {n} day{'s' if n>1 else ''}: {mn}" +
-                                     (f" → {mx}" if mn != mx else ""))
-            else:
-                self.date_info_var.set("")
-            
-            self._update_cards()
-            total_secs = sum(d["secs"] for d in self.data)
-            self.status_var.set(
-                f"Loaded {len(self.data)} processes, total {fmt_hms(total_secs)} "
-                f"from {len(dates_covered)} days (ActivityWatch)")
-            self.refresh()
-            
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            messagebox.showerror("ActivityWatch Error", 
-                f"Failed to load data:\n{str(e)}\n\n"
-                "Make sure ActivityWatch is running.\n"
-                "Download from: https://activitywatch.net")
-            self.status_var.set("Error: Could not load data")
+            logs_data, logs_descs, logs_dates = load_logs_by_date(self.log_folder, date_from, date_to)
+        
+        # Combine data (ActivityWatch prioritized)
+        rows, all_dates = combine_data(aw_data, aw_descs, logs_data, logs_descs)
+        
+        if not rows:
+            messagebox.showinfo("No data", 
+                "No data found from any source.\n\n"
+                "Make sure ActivityWatch is running OR you have selected a logs folder.")
+            return
+        
+        self.data = rows
+        
+        # Show which dates came from where
+        aw_count = len(aw_dates) if aw_dates else 0
+        logs_count = len(logs_dates) if logs_dates else 0
+        total_days = len(all_dates)
+        
+        if aw_count > 0 and logs_count > 0:
+            self.date_info_var.set(f"✓ {aw_count} days from ActivityWatch + {logs_count} days from logs")
+            source_msg = f"(ActivityWatch: {aw_count} days, Logs: {logs_count} days)"
+        elif aw_count > 0:
+            self.date_info_var.set(f"✓ {aw_count} days from ActivityWatch")
+            source_msg = "(ActivityWatch only)"
+        else:
+            self.date_info_var.set(f"✓ {logs_count} days from Log Files")
+            source_msg = "(Log files only - ActivityWatch not available)"
+        
+        self._update_cards()
+        total_secs = sum(d["secs"] for d in self.data)
+        self.status_var.set(
+            f"Loaded {len(self.data)} processes, total {fmt_hms(total_secs)} "
+            f"from {total_days} days {source_msg}")
+        self.refresh()
 
     def _update_cards(self):
         if not self.data:
@@ -645,7 +747,7 @@ class ScreenTimeDashboard(tk.Tk):
         self.ax.set_facecolor(SURFACE)
 
         if rows:
-            labels = [(r["desc"] or r["name"])[:24] for r in rows]
+            labels = [(r["desc"] or r["name"].replace(".exe",""))[:24] for r in rows]
             values = [r["secs"] / 3600 for r in rows]
             colors = [CAT_COLORS.get(r["cat"], ACCENT) for r in rows]
 
@@ -688,7 +790,7 @@ class ScreenTimeDashboard(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         for i, r in enumerate(rows, 1):
             pct  = f"{r['secs'] / total * 100:.1f}%"
-            name = (r["desc"] or r["name"])[:32]
+            name = (r["desc"] or r["name"].replace(".exe",""))[:32]
             self.tree.insert("", "end",
                              values=(i, name, r["cat"], fmt_hms(r["secs"]), pct))
 
